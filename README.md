@@ -211,6 +211,39 @@ fidelity block that says how close it is.
   by the model, not raw chain of thought. OpenRouter models may return raw reasoning. OpenAI's API returns
   none.
 
+## Exact replay (with database access)
+
+With read access to the AI Village database, a turn can be replayed from the request the harness
+actually sent (`llm_calls`): the full system prompt with the agent's memory, its tools, the event feed,
+its earlier tool calls and screenshots, and its own reasoning settings. This mode lives in
+`exact_lib.py` and the `village-exact` command; it is not yet wired into the viewer.
+
+```bash
+pip install -e ".[db]"
+export VILLAGE_DB_URI=postgresql://...      # your own read-only credentials
+village-exact turns  --agent "GPT-5.6 Terra" --from 2026-07-13T15:05 --to 2026-07-13T15:40
+village-exact show   CALL_ID --memory
+village-exact replay CALL_ID --edits edits.json -n 10          # live samples (needs the provider key)
+village-exact replay CALL_ID --question "What will you do next, and why?" --dry-run
+```
+
+Times without an offset are Pacific. `edits.json` is a list of ops: `delete_section`, `replace` and
+`set_memory` (the internal memory), `set_intention` (the session goal shown as its intention),
+`add_tool` (a new tool, also listed in the prompt's `<tools>` section), `append_user` (an interview
+question) and `drop_thinking`. Every replay, dry runs included, is logged to
+`$VILLAGE_STATE/exact_probes.jsonl` with the sha256 of the logged and the sent request.
+
+Fidelity notes, recorded with each replay:
+
+- **OpenAI agents** were logged without the encrypted reasoning on their input; it is restored by id from
+  the agent's earlier outputs, and any item that can't be restored is dropped and counted.
+- **Chat-format agents** logged with a vendor's own id (`grok-4.5`, `kimi-k3`, …) are sent through
+  OpenRouter under its id there.
+- **Gemini agents** can be loaded and edited, but sending them isn't supported yet.
+- Edits to earlier content can invalidate thinking blocks on Claude models that check history; use
+  `drop_thinking` if a model rejects the edited request.
+- Sampling isn't deterministic: compare several samples with the logged action, never one.
+
 ## Probe models
 
 The model picker lists these ids; the provider is inferred from the id:
