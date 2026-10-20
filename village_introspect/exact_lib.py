@@ -309,14 +309,19 @@ def parse_output(provider: str, out) -> dict:
             if t == "function_call":
                 actions.append({"tool": it.get("name"), "args": _args(it.get("arguments"))})
             elif t == "computer_call":
-                actions.append({"tool": "computer", "args": it.get("action") or {}})
+                # one `action`, or (newer API) a list of `actions`, each with a `type`
+                acts = it.get("actions") or ([it["action"]] if it.get("action") else [{}])
+                for a in acts:
+                    actions.append({"tool": "computer", "args": {"action": a.get("type"), **a}})
             elif t == "message":
                 text += [c.get("text", "") for c in it.get("content", []) if isinstance(c, dict)]
             elif t == "reasoning":
                 thinking += [s.get("text", "") for s in it.get("summary", []) if isinstance(s, dict)]
     elif provider == "chat":
-        ch = ((out or {}).get("choices") or [{}])[0]
-        msg = ch.get("message") or {}
+        out = out or {}
+        ch = (out.get("choices") or [{}])[0]
+        # a full completion, or (as the village logged them) the bare assistant message
+        msg = ch.get("message") or (out if "role" in out else {})
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function") or {}
             actions.append({"tool": fn.get("name"), "args": _args(fn.get("arguments"))})

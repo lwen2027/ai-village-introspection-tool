@@ -251,3 +251,16 @@ def test_estimate_uses_logged_output_and_price(monkeypatch):
 def test_price_override(monkeypatch):
     monkeypatch.setenv("VILLAGE_PRICES", '{"gpt-5.6-terra": [1.25, 10]}')
     assert ex.price_for("gpt-5.6-terra") == (1.25, 10)
+
+
+def test_parse_logged_shapes():
+    # chat-format outputs were logged as the bare assistant message
+    bare = {
+        "role": "assistant",
+        "content": "ok",
+        "tool_calls": [{"type": "function", "function": {"name": "pause", "arguments": '{"seconds":3600}'}}],
+    }
+    assert [ex.action_label(a) for a in ex.parse_output("chat", bare)["actions"]] == ["pause(3600)"]
+    # OpenAI computer calls with a list of actions
+    cc = [{"type": "computer_call", "actions": [{"type": "click", "x": 1, "y": 2, "button": "left"}]}]
+    assert [ex.action_label(a) for a in ex.parse_output("openai", cc)["actions"]] == ["computer.click"]
