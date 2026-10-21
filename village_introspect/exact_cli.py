@@ -3,6 +3,7 @@
     village-exact turns  --agent "GPT-5.6 Terra" --from 2026-07-13T15:00 --to 2026-07-13T15:30
     village-exact show   CALL_ID [--memory]
     village-exact replay CALL_ID [--edits edits.json] [--question "..."] [-n 5] [--dry-run]
+    village-exact batch  POINTS.json [--rules before_onset] [--question "..."] [-n 3] [--budget-usd 10] [--dry-run]
 
 Times without an offset are Pacific. Every replay (dry runs included) is appended to
 $VILLAGE_STATE/exact_probes.jsonl with the request's sha256 before and after modification.
@@ -16,6 +17,7 @@ import datetime
 import json
 import sys
 import uuid
+from pathlib import Path
 
 from . import exact_lib as ex
 from .config import STATE_DIR
@@ -157,6 +159,51 @@ def _cmd_replay(args) -> None:
     print(f"logged  {rec['replay_id']} → {STATE_DIR / 'exact_probes.jsonl'}")
 
 
+def _cmd_batch(args) -> None:
+    from . import exact_batch as eb
+
+    with open(args.points, encoding="utf-8") as f:
+        data = json.load(f)
+    rules = set(args.rules.split(",")) if args.rules else None
+    agents = set(args.agents.split(",")) if args.agents else None
+    points = eb.select_points(data, rules, agents, args.limit)
+    if args.questions and args.question:
+        raise SystemExit("pass --question or --questions, not both")
+    if args.questions:
+        variants = eb.load_variants(args.questions)
+        name = args.name or Path(args.questions).stem
+    else:
+        variants = [(eb.question_id(args.question, args.question_id), args.question)]
+        name = args.name or variants[0][0]
+    edits = []
+    if args.edits:
+        args.question = None
+        edits = _load_edits(args)
+    out_path = Path(args.out) if args.out else STATE_DIR / "batches" / f"{name}.jsonl"
+    print(
+        f"{len(points)} points × {len(variants)} question variant(s) · {args.n} samples each · "
+        f"batch {name} · output {out_path}"
+    )
+    with ex._connect() as conn:
+        items = eb.plan(conn, points, variants, args.n, args.assume_output, edits)
+    if args.providers:
+        keep = set(args.providers.split(","))
+        for it in items:
+            if "prepared" in it and "skip" not in it and it["prepared"]["provider"] not in keep:
+                it["skip"] = f"provider {it['prepared']['provider']} not in --providers"
+    planned = eb.print_plan(items, args.n)
+    if args.dry_run:
+        return
+    if planned > args.budget_usd and not args.force:
+        raise SystemExit(f"not sent: planned ${planned:.2f} is over --budget-usd {args.budget_usd:.2f}")
+    meta = {"batch": name, "points_file": str(args.points)}
+    _, run = eb.execute(items, meta, args.n, out_path, args.budget_usd, args.workers, args.keep_raw)
+    if run.stop:
+        print(f"stopped early: {run.stop}", file=sys.stderr)
+    print(f"spent ${run.spent:.2f} this run\n")
+    eb.summarize(out_path, name)
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(
         prog="village-exact", description=__doc__, formatter_class=argparse.RawTextHelpFormatter
@@ -178,8 +225,27 @@ def main(argv=None) -> None:
     r.add_argument("--keep-raw", action="store_true", help="keep each sample's raw response in the log")
     r.add_argument("--max-usd", type=float, default=1.0, help="don't send if the estimate is over this (default 1.00)")
     r.add_argument("--force", action="store_true", help="send even if the cost is over --max-usd or unknown")
+    b = sub.add_parser("batch", help="replay a set of interview points in parallel under a budget")
+    b.add_argument("points", help="interview points JSON (village-drift-explorer data/interview_points_v1.json)")
+    b.add_argument("--rules", help="comma-separated point rules to include, e.g. before_onset")
+    b.add_argument("--agents", help="comma-separated agent names to include")
+    b.add_argument("--providers", help="comma-separated providers to send: anthropic,openai,chat")
+    b.add_argument("--limit", type=int, help="only the first N selected points")
+    b.add_argument("--edits", help="JSON file with a list of edit ops applied to every point")
+    b.add_argument("--question", help="append an interview question as a user message")
+    b.add_argument("--question-id", help="label for the question (default: a hash of its text, or 'replay')")
+    b.add_argument("--questions", help="JSON file of question variants, each asked at every point (see exact_batch)")
+    b.add_argument("--name", help="batch name (default: the variants file's name, or the question id)")
+    b.add_argument("-n", type=int, default=1, help="samples per point (default 1)")
+    b.add_argument("--budget-usd", type=float, default=5.0, help="refuse a larger plan, stop at this spend (default 5)")
+    b.add_argument("--assume-output", type=int, default=1500, help="output tokens assumed where none were logged")
+    b.add_argument("--workers", type=int, default=4, help="points sent in parallel (default 4)")
+    b.add_argument("--out", help="output JSONL (default $VILLAGE_STATE/batches/<batch name>.jsonl); reruns resume")
+    b.add_argument("--dry-run", action="store_true", help="plan and price only, no model calls")
+    b.add_argument("--keep-raw", action="store_true", help="keep each sample's raw response")
+    b.add_argument("--force", action="store_true", help="start even if the plan is over --budget-usd")
     args = ap.parse_args(argv)
-    {"turns": _cmd_turns, "show": _cmd_show, "replay": _cmd_replay}[args.cmd](args)
+    {"turns": _cmd_turns, "show": _cmd_show, "replay": _cmd_replay, "batch": _cmd_batch}[args.cmd](args)
 
 
 if __name__ == "__main__":

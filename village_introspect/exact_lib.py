@@ -506,16 +506,29 @@ PRICES = {
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
+    "claude-opus-4-5": (5.0, 25.0),
     "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-3-opus": (15.0, 75.0),
 }
 # a rough allowance per screenshot where tokens can't be counted exactly (a 1024x768 PNG)
 IMAGE_TOKENS_APPROX = 1600
 
 
+def undated(model: str) -> str:
+    """A model id without a trailing release date: gpt-5-2025-08-07 → gpt-5, claude-3-opus-20240229 → claude-3-opus."""
+    return re.sub(r"-(\d{8}|\d{4}-\d{2}-\d{2})$", "", model or "")
+
+
+# Prices filled in at run time (e.g. from OpenRouter's catalog by exact_batch); VILLAGE_PRICES wins over these.
+EXTRA_PRICES: dict = {}
+
+
 def price_for(model: str) -> Optional[tuple]:
+    """($ in, $ out[, $ cache read]) per million tokens, or None if unknown."""
     extra = os.environ.get("VILLAGE_PRICES")
     if extra:
         try:
@@ -524,7 +537,33 @@ def price_for(model: str) -> Optional[tuple]:
                 return tuple(table[model])
         except ValueError:
             pass
-    return PRICES.get(model)
+    for m in (model, undated(model)):
+        if m in PRICES or m in EXTRA_PRICES:
+            return PRICES.get(m) or EXTRA_PRICES.get(m)
+    return None
+
+
+def usage_usd(provider: str, model: str, usage) -> Optional[float]:
+    """The cost of one sample from the usage its provider reported, or None if the price is unknown."""
+    if not usage:
+        return None
+    if provider == "chat" and usage.get("cost") is not None:  # OpenRouter reports the charge itself
+        return float(usage["cost"])
+    price = price_for(model)
+    if not price:
+        return None
+    p_in, p_out = price[0] / 1e6, price[1] / 1e6
+    if provider == "anthropic":  # cache writes at 1.25x and reads at 0.1x the input price (5-minute cache)
+        tin = usage.get("input_tokens") or 0
+        cache_w = usage.get("cache_creation_input_tokens") or 0
+        cache_r = usage.get("cache_read_input_tokens") or 0
+        return (tin + 1.25 * cache_w + 0.1 * cache_r) * p_in + (usage.get("output_tokens") or 0) * p_out
+    if provider == "openai":  # input_tokens includes the cached ones
+        p_read = price[2] / 1e6 if len(price) > 2 else 0.1 * p_in
+        tin = usage.get("input_tokens") or 0
+        cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
+        return (tin - cached) * p_in + cached * p_read + (usage.get("output_tokens") or 0) * p_out
+    return (usage.get("prompt_tokens") or 0) * p_in + (usage.get("completion_tokens") or 0) * p_out
 
 
 def _is_image_data(s: str) -> bool:
@@ -563,10 +602,13 @@ def count_input_tokens(prepared: dict) -> tuple:
     return approx_input_tokens(prepared["request"]), "approx"
 
 
-def estimate(prepared: dict, n: int = 1) -> dict:
-    """Input tokens, expected output tokens (the logged turn's own, when logged) and cost for n samples."""
+def estimate(prepared: dict, n: int = 1, assume_output: Optional[int] = None) -> dict:
+    """Input tokens, expected output tokens (the logged turn's own, when logged, else `assume_output`) and
+    cost for n samples."""
     tokens, how = count_input_tokens(prepared)
     out = prepared.get("logged_output_tokens")
+    if out is None:
+        out = assume_output
     price = price_for(prepared["model"])
     # A request with prompt caching on writes the cache on its first sample (1.25x the input price) and
     # reads it on later samples sent within the 5-minute TTL (0.1x); otherwise every sample pays full input.
