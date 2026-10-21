@@ -153,6 +153,24 @@ def test_restore_reasoning_fills_known_and_drops_unknown():
     assert out["store"] is False and "reasoning.encrypted_content" in out["include"]
 
 
+def test_items_after_a_dropped_reasoning_item_lose_their_server_ids():
+    req = openai_req()
+    req["input"][3:3] = [
+        {"id": "msg_1", "type": "message", "role": "assistant", "phase": "x", "content": [{"type": "output_text", "text": "Waiting."}]}
+    ]
+    req["input"].append({"id": "rs_3", "type": "reasoning", "summary": []})
+    req["input"].append({"id": "fc_3", "type": "function_call", "name": "pause", "call_id": "c3", "arguments": "{}"})
+    by_id = {"rs_3": {"id": "rs_3", "encrypted_content": "gAAAA"}}
+    out, stats = ex.restore_reasoning(req, by_id)
+    assert stats == {"reasoning_restored": 1, "reasoning_dropped": 2, "items_unpaired": 2}
+    inp = out["input"]
+    assert {"role": "assistant", "content": "Waiting."} in inp
+    fc1 = next(i for i in inp if i.get("call_id") == "c1")
+    assert "id" not in fc1 and fc1["name"] == "pause"
+    fc3 = next(i for i in inp if i.get("call_id") == "c3" and i.get("type") == "function_call")
+    assert fc3["id"] == "fc_3"  # its reasoning was restored, so the pairing stays
+
+
 def test_parse_output_each_provider():
     oa = [
         {"type": "reasoning", "summary": [{"text": "think"}]},
@@ -264,3 +282,68 @@ def test_parse_logged_shapes():
     # OpenAI computer calls with a list of actions
     cc = [{"type": "computer_call", "actions": [{"type": "click", "x": 1, "y": 2, "button": "left"}]}]
     assert [ex.action_label(a) for a in ex.parse_output("openai", cc)["actions"]] == ["computer.click"]
+
+
+SEP_OTHER = "\n              \n"
+EVENT_FEED = (
+    ex.FEED_HEADER
+    + '[\n  {\n    "actionType": "AGENT_TALK",\n    "agentName": "A",\n    "content": "hi",\n    "createdAt": "7/8/2026, 11:33:40 AM PDT"\n  }\n]'
+    + SEP_OTHER
+    + ex.FEED_REMINDER
+)
+
+
+def test_feed_time_matches_the_harness_format():
+    assert ex.feed_time("2026-07-08T18:33:48.5") == "7/8/2026, 11:33:48 AM PDT"
+    assert ex.feed_time("2026-07-10T20:58:12") == "7/10/2026, 1:58:12 PM PDT"
+    assert ex.feed_time("2026-07-10T19:05:00") == "7/10/2026, 12:05:00 PM PDT"
+
+
+def test_user_talk_is_appended_to_a_feed_that_has_events():
+    req = {"model": "deepseek/deepseek-v3.2", "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": [{"type": "text", "text": EVENT_FEED}]}]}
+    out, log = ex.apply_edits(req, [{"op": "user_talk", "text": "@A What is your goal?", "sender": "adam", "at": "7/8/2026, 11:33:48 AM PDT"}])
+    t = out["messages"][-1]["content"][0]["text"]
+    assert log[0]["delivered"] == "appended" and len(out["messages"]) == 2
+    events = __import__("json").loads(t[len(ex.FEED_HEADER) : t.rindex("]") + 1])
+    assert events[-1] == {"actionType": "USER_TALK", "userName": "adam", "content": "@A What is your goal?", "createdAt": "7/8/2026, 11:33:48 AM PDT"}
+    assert t.endswith("]" + SEP_OTHER + ex.FEED_REMINDER)
+
+
+def test_user_talk_fills_claudes_empty_feed_with_that_harness_spacing():
+    req = anthropic_req()
+    req["messages"].append({"role": "user", "content": [{"type": "text", "text": ex.FEED_HEADER + "[\n  {}\n]\n\n" + ex.FEED_REMINDER}]})
+    req["messages"].append({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+    req["messages"].append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t"}, {"type": "text", "text": ex.FEED_EMPTY}]})
+    out, log = ex.apply_edits(req, [{"op": "user_talk", "text": "Q?", "sender": "adam", "at": "7/7/2026, 11:54:02 AM PDT"}])
+    blocks = out["messages"][-1]["content"]
+    assert log[0]["delivered"] == "filled" and blocks[0]["type"] == "tool_result"
+    assert blocks[1]["text"].startswith(ex.FEED_HEADER + "[\n  {\n") and blocks[1]["text"].endswith("]\n\n" + ex.FEED_REMINDER)
+    assert '"userName": "adam"' in blocks[1]["text"] and ex.FEED_EMPTY not in blocks[1]["text"]
+
+
+def test_user_talk_adds_a_feed_after_the_agents_own_last_output():
+    req = openai_req()
+    req["input"].append({"role": "user", "content": [{"type": "input_text", "text": EVENT_FEED}]})
+    req["input"].append({"role": "assistant", "content": "Nothing is directed at me."})
+    out, log = ex.apply_edits(req, [{"op": "user_talk", "text": "Q?", "sender": "adam", "at": "7/10/2026, 1:58:12 PM PDT"}])
+    last = out["input"][-1]
+    assert log[0]["delivered"] == "new_feed" and last["role"] == "user" and last["content"][0]["type"] == "input_text"
+    assert last["content"][0]["text"].endswith("]" + SEP_OTHER + ex.FEED_REMINDER)  # spacing copied from its earlier feed
+
+
+def test_kimi_requests_are_replayed_on_moonshots_api_unchanged():
+    req = {"model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "", "reasoning_content": "earlier thought", "tool_calls": []}]}
+    pp = ex.prepare({"call_id": "c", "agent": "Kimi K3", "request": req, "output": {"role": "assistant", "content": "x"}})
+    assert pp["provider"] == "moonshot" and pp["request"]["model"] == "kimi-k3"
+    assert pp["request"]["messages"][1]["reasoning_content"] == "earlier thought" and pp["sha256_sent"] == pp["sha256_original"]
+    out = {"choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "think", "tool_calls": []}}]}
+    assert ex.parse_output("moonshot", out)["thinking"] == "think"
+
+
+def test_new_feed_copies_a_later_harness_clock_line_with_the_questions_time():
+    feed = EVENT_FEED.replace(SEP_OTHER + ex.FEED_REMINDER, "\n\n" + ex.FEED_REMINDER + "\n\nThe current time is Wednesday, August 5, 2026, 10:02 AM PT.")
+    req = {"model": "kimi-k3", "messages": [{"role": "user", "content": feed}, {"role": "assistant", "content": "ok"}]}
+    out, log = ex.apply_edits(req, [{"op": "user_talk", "text": "Q?", "sender": "adam", "at": "8/5/2026, 10:03:01 AM PDT"}])
+    t = out["messages"][-1]["content"][0]["text"]
+    assert log[0]["delivered"] == "new_feed"
+    assert t.endswith("]\n\n" + ex.FEED_REMINDER + "\n\nThe current time is Wednesday, August 5, 2026, 10:03 AM PT.")

@@ -40,7 +40,7 @@ from . import exact_lib as ex
 from .config import STATE_DIR
 from .probe_jobs import _append_line
 
-SENDABLE = {"anthropic", "openai", "chat"}
+SENDABLE = {"anthropic", "openai", "chat", "moonshot"}
 RETRY_DELAYS = (5, 15, 45, 120)  # seconds before each retry of a rate-limited or failed request
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 
@@ -122,10 +122,32 @@ def openrouter_prices(models) -> dict:
 # --------------------------------------------------------------------------------------------------
 # planning
 # --------------------------------------------------------------------------------------------------
-def plan(conn, points: list, variants: list, n: int, assume_output: int, edits: Optional[list] = None) -> list:
+def question_op(text: str, call: dict, deliver: str, sender: Optional[str], mention: bool) -> dict:
+    """The edit op that asks `text` at a logged call: as a human's chat message in the turn's feed
+    (deliver='user_talk', timed at the call and, with `mention`, @-addressed to the agent, as humans in the
+    village write), or as a bare user message (deliver='append')."""
+    if deliver == "append":
+        return {"op": "append_user", "text": text}
+    if not sender:
+        raise ValueError("delivering a question as user_talk needs a sender name")
+    body = f"@{call['agent']} {text}" if mention and call.get("agent") else text
+    return {"op": "user_talk", "text": body, "sender": sender, "at": ex.feed_time(call["created_at"])}
+
+
+def plan(
+    conn,
+    points: list,
+    variants: list,
+    n: int,
+    assume_output: int,
+    edits: Optional[list] = None,
+    deliver: str = "user_talk",
+    sender: Optional[str] = None,
+    mention: bool = True,
+) -> list:
     """One entry per (point, question variant): {key, agent, point, question_id, question, edits,
     prepared?, estimate?, skip?}. `variants` is [(question id, text or None for a plain replay)]; `edits`
-    are applied before the question. No model calls."""
+    are applied before the question, which is delivered per question_op. No model calls."""
     items = []
     for agent, p in points:
         try:
@@ -134,12 +156,17 @@ def plan(conn, points: list, variants: list, n: int, assume_output: int, edits: 
         except Exception as e:  # noqa: BLE001 - reported in the plan, the rest still runs
             call, err = None, f"could not load: {type(e).__name__}: {str(e)[:200]}"
         for qid, text in variants:
-            ops = list(edits or []) + ([{"op": "append_user", "text": text}] if text else [])
-            item = {"key": point_key(agent, p), "agent": agent, "point": p, "question_id": qid, "question": text, "edits": ops}
+            item = {"key": point_key(agent, p), "agent": agent, "point": p, "question_id": qid, "question": text}
             items.append(item)
             if err:
                 item["skip"] = err
                 continue
+            try:
+                ops = list(edits or []) + ([question_op(text, call, deliver, sender, mention)] if text else [])
+            except ValueError as e:
+                item["skip"] = str(e)
+                continue
+            item["edits"] = ops
             try:
                 pp = ex.prepare(call, ops, conn=conn)
             except Exception as e:  # noqa: BLE001
@@ -271,9 +298,15 @@ def run_point(run: Run, it: dict, meta: dict, n: int, done: set, keep_raw: bool,
                     continue
                 s = {"error": f"{type(e).__name__}: {str(e)[:500]}"}
                 break
+        raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+        if raw.get("provider"):  # OpenRouter: the upstream provider that actually served the sample
+            rec["served_by"] = raw["provider"]
+        if raw.get("model") and raw["model"] != pp["model"]:
+            rec["served_model"] = raw["model"]
         if not keep_raw:
             s.pop("raw", None)
         rec.update(s)
+        rec["tool_calls"] = s.get("actions", [])  # with their arguments: a chat message's text lives here
         rec["actions"] = [ex.action_label(a) for a in s.get("actions", [])]
         rec["usd"] = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
         run.charge(rec["usd"])

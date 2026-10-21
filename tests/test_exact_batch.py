@@ -77,6 +77,7 @@ def test_run_point_writes_one_record_per_sample_without_raw(tmp_path, monkeypatc
     lines = [json.loads(x) for x in (tmp_path / "out.jsonl").read_text().splitlines()]
     assert len(lines) == 3 and "raw" not in lines[0]
     assert lines[0]["actions"] == ["pause(600)"] and lines[0]["question"] == "Why?" and lines[0]["logged_action"] == "pause(600)"
+    assert lines[0]["tool_calls"] == [{"tool": "pause", "args": {"seconds": 600}}]
     assert run.spent == pytest.approx(3 * (1000 * 5e-6 + 100 * 25e-6))
 
 
@@ -187,7 +188,7 @@ def test_plan_loads_each_point_once_and_prepares_one_run_per_variant(monkeypatch
     monkeypatch.setattr(eb, "openrouter_prices", lambda models: {})
     points = eb.select_points(DATA, rules={"before_onset"}, agents={"Claude Opus 4.7"})
     variants = [("a", "Why?"), ("b", "How come?"), ("replay", None)]
-    items = eb.plan(None, points, variants, 2, 1500, edits=[{"op": "drop_thinking"}])
+    items = eb.plan(None, points, variants, 2, 1500, edits=[{"op": "drop_thinking"}], deliver="append")
     assert loads == ["c1"] and len(items) == 3
     assert [it["question_id"] for it in items] == ["a", "b", "replay"]
     assert prepared[0] == [{"op": "drop_thinking"}, {"op": "append_user", "text": "Why?"}]
@@ -205,3 +206,20 @@ def test_variant_runs_record_their_own_question_and_resume_separately(tmp_path, 
     recs, _ = eb.execute([a, b], meta, 2, out, 10.0, 2, False, log=lambda *_: None)
     assert sorted((r["question_id"], r["sample"]) for r in recs) == [("b", 0), ("b", 1)]
     assert {r["question"] for r in recs} == {"How come?"}
+
+
+def test_records_which_provider_served_a_chat_sample(tmp_path, monkeypatch):
+    monkeypatch.setattr(ex, "send", lambda pp: {**ok_send(pp), "raw": {"provider": "DeepSeek", "model": "deepseek/deepseek-v3.2-exp"}})
+    it = item("DeepSeek-V3.2", "c7", "deepseek/deepseek-v3.2", "chat")
+    recs = eb.run_point(eb.Run(tmp_path / "o.jsonl", 10.0), it, META, 1, set(), False, lambda *_: None)
+    assert recs[0]["served_by"] == "DeepSeek" and recs[0]["served_model"] == "deepseek/deepseek-v3.2-exp" and "raw" not in recs[0]
+
+
+def test_question_op_mentions_the_agent_and_times_the_message_at_the_call():
+    call = {"agent": "DeepSeek-V3.2", "created_at": "2026-07-08T18:33:48"}
+    op = eb.question_op("What is your goal?", call, "user_talk", "adam", True)
+    assert op == {"op": "user_talk", "text": "@DeepSeek-V3.2 What is your goal?", "sender": "adam", "at": "7/8/2026, 11:33:48 AM PDT"}
+    assert eb.question_op("Q?", call, "user_talk", "adam", False)["text"] == "Q?"
+    assert eb.question_op("Q?", call, "append", None, True) == {"op": "append_user", "text": "Q?"}
+    with pytest.raises(ValueError):
+        eb.question_op("Q?", call, "user_talk", None, True)

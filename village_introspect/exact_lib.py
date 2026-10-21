@@ -172,6 +172,98 @@ def _append_user(req: dict, provider: str, text: str) -> None:
         req["contents"].append({"role": "user", "parts": [{"text": text}]})
 
 
+# The harness's event feed, as it appears in a user message: a JSON array of events (2-space indented),
+# between a header and a reminder. With nothing new, Claude's harness sends FEED_EMPTY instead.
+FEED_PREFIX = "Here is what has happened"
+FEED_HEADER = (
+    "Here is what has happened since your last turn (including messages you sent back to chat, make sure to "
+    "never send repetitive messages back to chat): "
+)
+FEED_EMPTY = "Here is what has happened in chat since your last turn: no new events"
+FEED_REMINDER = "Make sure to address any messages directed at you."
+
+
+def feed_time(ts) -> str:
+    """A timestamp as the feed writes it: 7/8/2026, 11:33:40 AM PDT (naive datetimes are UTC)."""
+    if isinstance(ts, str):
+        ts = datetime.datetime.fromisoformat(ts)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=datetime.timezone.utc)
+    t = ts.astimezone(PT)
+    return f"{t.month}/{t.day}/{t.year}, {t.hour % 12 or 12}:{t:%M:%S} {'AM' if t.hour < 12 else 'PM'} PDT"
+
+
+def _event_json(event: dict) -> str:
+    """One event as it sits inside the feed array: indented by 2 under the array's own 2."""
+    return "\n".join("  " + line for line in json.dumps(event, indent=2, ensure_ascii=False).splitlines())
+
+
+def _feed_blocks(msg: dict) -> list:
+    """[(index or None, text)] of the text parts of a message (None: the content is a plain string)."""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return [(None, c)]
+    return [(i, b["text"]) for i, b in enumerate(c or []) if isinstance(b, dict) and isinstance(b.get("text"), str)]
+
+
+def _set_block(msg: dict, i, text: str) -> None:
+    if i is None:
+        msg["content"] = text
+    else:
+        msg["content"][i]["text"] = text
+
+
+CURRENT_TIME_RE = re.compile(r"The current time is [^\n]*? PT\.")
+
+
+def _clock_line(at: str) -> str:
+    """'The current time is Wednesday, August 5, 2026, 10:03 AM PT.' for a feed timestamp."""
+    t = datetime.datetime.strptime(at.replace(" PDT", ""), "%m/%d/%Y, %I:%M:%S %p")
+    return f"The current time is {t:%A}, {t:%B} {t.day}, {t.year}, {t.hour % 12 or 12}:{t:%M} {t:%p} PT."
+
+
+def _feed_suffix(msgs: list, at: str) -> str:
+    """What follows the event array in this request's latest earlier feed (harnesses differ: the reminder
+    after "\\n\\n" for Claude, after "\\n              \\n" for others, and later harnesses add the current
+    time), with any clock line set to `at`. The Claude form if there's no feed to copy."""
+    for m in reversed(msgs):
+        for _, t in _feed_blocks(m) if isinstance(m, dict) else []:
+            if t.startswith(FEED_PREFIX) and FEED_REMINDER in t and "]" in t:
+                tail = t[t.rindex("]") + 1 :]
+                if FEED_REMINDER in tail:
+                    return CURRENT_TIME_RE.sub(lambda _: _clock_line(at), tail)
+    return "\n\n" + FEED_REMINDER
+
+
+def add_user_talk(req: dict, provider: str, text: str, sender: str, at: str) -> str:
+    """Deliver `text` the way a human's chat message reaches the agent: a USER_TALK event in the feed of
+    the turn being replayed. Returns how: 'appended' (to the feed's events), 'filled' (an empty feed), or
+    'new_feed' (the request had no feed after the agent's last output, so one is added)."""
+    event = {"actionType": "USER_TALK", "userName": sender, "content": text, "createdAt": at}
+    msgs = req["messages"] if provider in ("anthropic", "chat") else req["input"] if provider == "openai" else None
+    if msgs is None:
+        raise ValueError(f"user_talk is not supported for {provider} requests")
+    last = msgs[-1]
+    if last.get("role") == "user":
+        for i, t in reversed(_feed_blocks(last)):
+            if t.startswith(FEED_EMPTY):
+                _set_block(last, i, FEED_HEADER + "[\n" + _event_json(event) + "\n]" + _feed_suffix(msgs[:-1], at) + t[len(FEED_EMPTY):])
+                return "filled"
+            if t.startswith(FEED_PREFIX) and "\n]" in t:
+                k = t.rindex("\n]")
+                _set_block(last, i, t[:k] + ",\n" + _event_json(event) + t[k:])
+                return "appended"
+    feed = FEED_HEADER + "[\n" + _event_json(event) + "\n]" + _feed_suffix(msgs, at)
+    if provider == "openai":
+        msgs.append({"role": "user", "content": [{"type": "input_text", "text": feed}]})
+    elif last.get("role") == "user":  # a user message that isn't a feed (e.g. only tool results)
+        c = last["content"]
+        last["content"] = ([{"type": "text", "text": c}] if isinstance(c, str) else list(c)) + [{"type": "text", "text": feed}]
+    else:
+        msgs.append({"role": "user", "content": [{"type": "text", "text": feed}]})
+    return "new_feed"
+
+
 def apply_edits(req: dict, edits: list) -> tuple:
     """(modified copy, log). Ops:
     {"op": "delete_section", "heading": str}      remove a section of the internal memory
@@ -181,6 +273,9 @@ def apply_edits(req: dict, edits: list) -> tuple:
     {"op": "add_tool", "tool": {name, description, parameters}, "doc": str?}
                                                   offer a new tool (and list it in the <tools> section)
     {"op": "append_user", "text": str}            add a user message at the end (an interview question)
+    {"op": "user_talk", "text": str, "sender": str, "at": str}
+                                                  deliver a question as a human's chat message: a USER_TALK
+                                                  event in the replayed turn's feed (see add_user_talk)
     {"op": "drop_thinking"}                       drop earlier Anthropic thinking blocks (needed when an
                                                   edit would invalidate them on models that check)"""
     out = copy.deepcopy(req)
@@ -230,6 +325,9 @@ def apply_edits(req: dict, edits: list) -> tuple:
         elif op == "append_user":
             _append_user(out, provider, e["text"])
             log.append(e)
+        elif op == "user_talk":
+            how = add_user_talk(out, provider, e["text"], e["sender"], e["at"])
+            log.append({**e, "delivered": how})
         elif op == "drop_thinking":
             n = 0
             if provider == "anthropic":
@@ -254,19 +352,39 @@ def request_sha(req: dict) -> str:
 def restore_reasoning(req: dict, by_id: dict) -> tuple:
     """(copy, stats): fill each input reasoning item's encrypted_content from `by_id` (reasoning items from
     earlier outputs, keyed by id); drop items that can't be restored, since a bare id only resolves in the
-    org that stored it. Also asks for encrypted reasoning back, so a follow-up turn could round-trip it."""
+    org that stored it. The output items that followed a dropped reasoning item (until the next user or tool
+    result item) lose their server ids, which the API would otherwise reject without that reasoning: an
+    assistant message is sent as plain assistant text, a tool call without its `id`. Also asks for
+    encrypted reasoning back, so a follow-up turn could round-trip it."""
     out = copy.deepcopy(req)
-    restored = dropped = 0
-    items = []
+    restored = dropped = unpaired = 0
+    items, orphaned = [], False
     for it in out.get("input", []):
-        if isinstance(it, dict) and it.get("type") == "reasoning" and not it.get("encrypted_content"):
-            src = by_id.get(it.get("id"))
-            if src and src.get("encrypted_content"):
-                it = {**it, "encrypted_content": src["encrypted_content"]}
-                restored += 1
+        if not isinstance(it, dict):
+            items.append(it)
+            continue
+        if it.get("type") == "reasoning":
+            if it.get("encrypted_content"):
+                orphaned = False
             else:
-                dropped += 1
-                continue
+                src = by_id.get(it.get("id"))
+                if src and src.get("encrypted_content"):
+                    it = {**it, "encrypted_content": src["encrypted_content"]}
+                    restored += 1
+                    orphaned = False
+                else:
+                    dropped += 1
+                    orphaned = True
+                    continue
+        elif it.get("role") in ("user", "system", "developer") or str(it.get("type", "")).endswith("_output"):
+            orphaned = False
+        elif orphaned and it.get("id"):
+            unpaired += 1
+            if it.get("type") == "message":
+                text = "".join(c.get("text", "") for c in it.get("content") or [] if isinstance(c, dict))
+                it = {"role": "assistant", "content": text}
+            else:
+                it = {k: v for k, v in it.items() if k != "id"}
         items.append(it)
     out["input"] = items
     out["store"] = False
@@ -274,7 +392,10 @@ def restore_reasoning(req: dict, by_id: dict) -> tuple:
     if "reasoning.encrypted_content" not in include:
         include.append("reasoning.encrypted_content")
     out["include"] = include
-    return out, {"reasoning_restored": restored, "reasoning_dropped": dropped}
+    stats = {"reasoning_restored": restored, "reasoning_dropped": dropped}
+    if unpaired:
+        stats["items_unpaired"] = unpaired
+    return out, stats
 
 
 # --------------------------------------------------------------------------------------------------
@@ -317,7 +438,7 @@ def parse_output(provider: str, out) -> dict:
                 text += [c.get("text", "") for c in it.get("content", []) if isinstance(c, dict)]
             elif t == "reasoning":
                 thinking += [s.get("text", "") for s in it.get("summary", []) if isinstance(s, dict)]
-    elif provider == "chat":
+    elif provider in ("chat", "moonshot"):
         out = out or {}
         ch = (out.get("choices") or [{}])[0]
         # a full completion, or (as the village logged them) the bare assistant message
@@ -468,6 +589,9 @@ def prepare(call: dict, edits: Optional[list] = None, conn=None) -> dict:
         by_id = reasoning_index(conn, call["agent_id"], call["created_at"]) if conn is not None else {}
         req, stats = restore_reasoning(req, by_id)
         notes.append(stats)
+    elif provider == "chat" and _is_moonshot_model(req.get("model")):
+        provider = "moonshot"
+        notes.append({"sent_to": f"Moonshot's API ({MOONSHOT_API}) as logged"})
     elif provider == "chat" and "/" not in (req.get("model") or ""):
         mapped = OPENROUTER_IDS.get(req.get("model"))
         if mapped:
@@ -547,7 +671,7 @@ def usage_usd(provider: str, model: str, usage) -> Optional[float]:
     """The cost of one sample from the usage its provider reported, or None if the price is unknown."""
     if not usage:
         return None
-    if provider == "chat" and usage.get("cost") is not None:  # OpenRouter reports the charge itself
+    if provider in ("chat", "moonshot") and usage.get("cost") is not None:  # OpenRouter reports the charge itself
         return float(usage["cost"])
     price = price_for(model)
     if not price:
@@ -636,12 +760,17 @@ def _uses_cache(req: dict) -> bool:
     return "cache_control" in req or any(p and p[-1] == "cache_control" for p, _ in _strings(req))
 
 
-# Chat-format agents logged with a vendor's own id are reached through OpenRouter under its id there.
+# Chat-format agents logged with a vendor's own id are reached through OpenRouter under its id there,
+# except Moonshot's: the village calls Kimi models on Moonshot's own API (its outputs carry Moonshot's
+# `reasoning_content`), so they are replayed there, unchanged (MOONSHOT_API_KEY).
 OPENROUTER_IDS = {
     "grok-4.5": "x-ai/grok-4.5",
-    "kimi-k3": "moonshotai/kimi-k3",
-    "kimi-k2.6": "moonshotai/kimi-k2.6",
 }
+MOONSHOT_API = "https://api.moonshot.ai/v1"
+
+
+def _is_moonshot_model(model: str) -> bool:
+    return (model or "").startswith("kimi-")
 
 
 def _split_known(fn, kw: dict) -> tuple:
@@ -681,6 +810,14 @@ def send(prepared: dict) -> dict:
         import openai
 
         client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ.get("OPENROUTER_API_KEY"))
+        known, extra = _split_known(client.chat.completions.create, req)
+        if extra:
+            known["extra_body"] = extra
+        raw = client.chat.completions.create(**known).to_dict()
+    elif provider == "moonshot":
+        import openai
+
+        client = openai.OpenAI(base_url=MOONSHOT_API, api_key=os.environ.get("MOONSHOT_API_KEY"))
         known, extra = _split_known(client.chat.completions.create, req)
         if extra:
             known["extra_body"] = extra
