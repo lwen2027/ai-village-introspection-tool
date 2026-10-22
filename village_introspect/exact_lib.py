@@ -19,7 +19,7 @@ Request formats, recognised by their top-level keys:
   anthropic  {model, messages, tools, thinking, betas?, cache_control?}  — Claude agents
   openai     {model, input, tools, reasoning}                            — GPT agents (Responses API)
   chat       {model, messages, tools, provider?}                         — OpenRouter-style agents
-  gemini     {model, contents, config}                                   — Gemini agents (send unsupported)
+  gemini     {model, contents, config}                                   — Gemini agents (REST generateContent)
 """
 
 from __future__ import annotations
@@ -306,7 +306,9 @@ def apply_edits(req: dict, edits: list) -> tuple:
                                                   deliver a question as a chat message from a human (USER_TALK)
                                                   or another agent (AGENT_TALK) in the replayed turn's feed
     {"op": "drop_thinking"}                       drop earlier Anthropic thinking blocks (needed when an
-                                                  edit would invalidate them on models that check)"""
+                                                  edit would invalidate them on models that check)
+    {"op": "no_tools"}                            keep the tools but let the model call none this turn
+                                                  (tool_choice none), so it answers in text"""
     out = copy.deepcopy(req)
     provider = provider_of(out)
     log = []
@@ -366,6 +368,14 @@ def apply_edits(req: dict, edits: list) -> tuple:
                         n += len(m["content"]) - len(kept)
                         m["content"] = kept
             log.append({"op": op, "dropped": n})
+        elif op == "no_tools":
+            if provider == "anthropic":
+                out["tool_choice"] = {"type": "none"}
+            elif provider in ("openai", "chat"):
+                out["tool_choice"] = "none"
+            elif provider == "gemini":
+                out.setdefault("config", {})["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+            log.append(e)
         else:
             raise ValueError(f"unknown edit op {op!r}")
     return out, log
@@ -609,6 +619,28 @@ def reasoning_index(conn, agent_id: str, before: str, hours: int = 24) -> dict:
 # --------------------------------------------------------------------------------------------------
 # preparing and sending
 # --------------------------------------------------------------------------------------------------
+# OpenRouter models whose logged encrypted reasoning expires ("reasoning `encrypted_content` has expired");
+# their reasoning.encrypted entries are dropped and the readable reasoning text kept, as for GPT agents
+# whose reasoning can't be restored.
+EXPIRING_REASONING = ("meta/",)
+
+
+def drop_encrypted_reasoning(req: dict) -> int:
+    """Removes reasoning.encrypted entries from a chat request's assistant messages; returns how many."""
+    dropped = 0
+    for m in req.get("messages", []):
+        details = m.get("reasoning_details")
+        if not details:
+            continue
+        kept = [d for d in details if d.get("type") != "reasoning.encrypted"]
+        dropped += len(details) - len(kept)
+        if kept:
+            m["reasoning_details"] = kept
+        else:
+            del m["reasoning_details"]
+    return dropped
+
+
 def prepare(call: dict, edits: Optional[list] = None, conn=None) -> dict:
     """The request to send for a logged call, with its fidelity notes. No model call."""
     original = call["request"]
@@ -626,6 +658,10 @@ def prepare(call: dict, edits: Optional[list] = None, conn=None) -> dict:
         if mapped:
             notes.append({"model_routed": f"{req['model']} sent as {mapped} via OpenRouter"})
             req["model"] = mapped
+    if provider == "chat" and (req.get("model") or "").startswith(EXPIRING_REASONING):
+        dropped = drop_encrypted_reasoning(req)
+        if dropped:
+            notes.append({"encrypted_reasoning_dropped": dropped})
     edit_log = []
     if edits:
         req, edit_log = apply_edits(req, edits)
@@ -716,6 +752,12 @@ def usage_usd(provider: str, model: str, usage) -> Optional[float]:
         tin = usage.get("input_tokens") or 0
         cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
         return (tin - cached) * p_in + cached * p_read + (usage.get("output_tokens") or 0) * p_out
+    if provider == "gemini":  # promptTokenCount includes the cached tokens; thoughts are billed as output
+        p_read = price[2] / 1e6 if len(price) > 2 else 0.25 * p_in
+        tin = usage.get("promptTokenCount") or 0
+        cached = usage.get("cachedContentTokenCount") or 0
+        out = (usage.get("candidatesTokenCount") or 0) + (usage.get("thoughtsTokenCount") or 0)
+        return (tin - cached) * p_in + cached * p_read + out * p_out
     return (usage.get("prompt_tokens") or 0) * p_in + (usage.get("completion_tokens") or 0) * p_out
 
 
@@ -796,6 +838,36 @@ OPENROUTER_IDS = {
     "grok-4.5": "x-ai/grok-4.5",
 }
 MOONSHOT_API = "https://api.moonshot.ai/v1"
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+# google-genai config fields that are request-level in the REST body; the rest go in generationConfig.
+# The REST API takes field names in camelCase or snake_case alike.
+_GEMINI_TOP = {
+    "tools", "toolConfig", "tool_config", "systemInstruction", "system_instruction",
+    "safetySettings", "safety_settings", "cachedContent", "cached_content",
+}
+
+
+class GeminiError(Exception):
+    """An error response from the Gemini API, with its HTTP status (as the SDK errors carry it)."""
+
+    def __init__(self, status_code: int, body: str):
+        super().__init__(f"Error code: {status_code} - {body}")
+        self.status_code = status_code
+
+
+def gemini_body(req: dict) -> dict:
+    """The REST generateContent body for a logged google-genai request {model, contents, config}."""
+    body, gen = {"contents": req["contents"]}, {}
+    for k, v in (req.get("config") or {}).items():
+        if k in _GEMINI_TOP:
+            if k in ("systemInstruction", "system_instruction") and isinstance(v, str):
+                v = {"parts": [{"text": v}]}
+            body[k] = v
+        else:
+            gen[k] = v
+    if gen:
+        body["generationConfig"] = gen
+    return body
 
 
 def _is_moonshot_model(model: str) -> bool:
@@ -851,6 +923,19 @@ def send(prepared: dict) -> dict:
         if extra:
             known["extra_body"] = extra
         raw = client.chat.completions.create(**known).to_dict()
+    elif provider == "gemini":
+        import httpx2  # the openai SDK's HTTP client, which brings its own certificates
+
+        r = httpx2.post(
+            f"{GEMINI_API}/models/{req['model']}:generateContent",
+            json=gemini_body(req),
+            headers={"x-goog-api-key": os.environ.get("GEMINI_API_KEY", "")},
+            timeout=600,
+        )
+        if r.status_code >= 400:
+            raise GeminiError(r.status_code, r.text[:1000])
+        raw = r.json()
+        return {**parse_output(provider, raw), "usage": raw.get("usageMetadata"), "raw": raw}
     else:
         raise NotImplementedError(f"sending {provider} requests is not supported yet")
     parsed = parse_output(provider, raw)

@@ -376,3 +376,88 @@ def test_continue_after_tool_lays_out_the_next_turn_like_the_harness():
     assert f["content"] == [{"type": "text", "text": ex.FEED_EMPTY}] and len(out["messages"]) == len(req["messages"]) + 3
     with pytest.raises(ValueError):
         ex.continue_after_tool(req, {"content": [{"type": "text", "text": "hi"}]}, "x")
+
+
+def test_gemini_body_moves_request_level_config_out_of_generation_config():
+    req = {
+        "model": "gemini-3.5-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "config": {"tools": [{"functionDeclarations": []}], "thinkingConfig": {"includeThoughts": True}, "system_instruction": "sys"},
+    }
+    body = ex.gemini_body(req)
+    assert body["tools"] == req["config"]["tools"] and body["contents"] == req["contents"]
+    assert body["system_instruction"] == {"parts": [{"text": "sys"}]}
+    assert body["generationConfig"] == {"thinkingConfig": {"includeThoughts": True}} and "model" not in body
+
+
+class _Resp:
+    def __init__(self, status, data):
+        self.status_code, self._data, self.text = status, data, str(data)
+
+    def json(self):
+        return self._data
+
+
+def test_send_gemini_posts_the_body_and_prices_thoughts_as_output(monkeypatch):
+    import httpx2
+
+    sent = {}
+    out = {
+        "candidates": [{"content": {"parts": [{"thought": True, "text": "t"}, {"text": "My goal is X."}]}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 1000, "cachedContentTokenCount": 400, "candidatesTokenCount": 10, "thoughtsTokenCount": 90},
+    }
+
+    def post(url, json, headers, timeout):
+        sent.update(url=url, json=json, key=headers["x-goog-api-key"])
+        return _Resp(200, out)
+
+    monkeypatch.setattr(httpx2, "post", post)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    s = ex.send({"provider": "gemini", "model": "gemini-3.5-flash", "request": {"model": "gemini-3.5-flash", "contents": [], "config": {}}})
+    assert sent["url"].endswith("/models/gemini-3.5-flash:generateContent") and sent["key"] == "k"
+    assert s["text"] == "My goal is X." and s["thinking"] == "t" and s["stop"] == "STOP"
+    monkeypatch.setitem(ex.EXTRA_PRICES, "gemini-3.5-flash", (1.0, 10.0, 0.25))
+    usd = ex.usage_usd("gemini", "gemini-3.5-flash", s["usage"])
+    assert usd == pytest.approx((600 * 1.0 + 400 * 0.25 + 100 * 10.0) / 1e6)
+
+
+def test_send_gemini_raises_with_the_status_for_retries(monkeypatch):
+    import httpx2
+
+    monkeypatch.setattr(httpx2, "post", lambda *a, **k: _Resp(429, {"error": "slow down"}))
+    with pytest.raises(ex.GeminiError) as e:
+        ex.send({"provider": "gemini", "model": "m", "request": {"model": "m", "contents": [], "config": {}}})
+    assert e.value.status_code == 429
+
+
+def test_prepare_drops_expiring_encrypted_reasoning_for_meta_models_only():
+    def call(model):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "reasoning": "thought",
+             "reasoning_details": [{"type": "reasoning.encrypted", "data": "x"}, {"type": "reasoning.text", "text": "thought"}]},
+            {"role": "assistant", "content": "", "reasoning_details": [{"type": "reasoning.encrypted", "data": "y"}]},
+        ]
+        return {"call_id": "c", "agent_id": "a", "created_at": "2026-09-08T18:33:00Z",
+                "request": {"model": model, "messages": msgs, "tools": []}, "output": {}}
+
+    pp = ex.prepare(call("meta/muse-spark-1.3"))
+    m = pp["request"]["messages"]
+    assert m[1]["reasoning_details"] == [{"type": "reasoning.text", "text": "thought"}] and m[1]["reasoning"] == "thought"
+    assert "reasoning_details" not in m[2] and {"encrypted_reasoning_dropped": 2} in pp["notes"]
+    other = ex.prepare(call("z-ai/glm-5.2"))
+    assert len(other["request"]["messages"][2]["reasoning_details"]) == 1
+
+
+@pytest.mark.parametrize("make, get", [
+    (anthropic_req, lambda r: r["tool_choice"] == {"type": "none"}),
+    (openai_req, lambda r: r["tool_choice"] == "none"),
+    (chat_req, lambda r: r["tool_choice"] == "none"),
+    (gemini_req, lambda r: r["config"]["toolConfig"] == {"functionCallingConfig": {"mode": "NONE"}}),
+])
+def test_no_tools_sets_tool_choice_none_and_keeps_the_tools(make, get):
+    req = make()
+    out, log = ex.apply_edits(req, [{"op": "no_tools"}])
+    assert get(out) and log == [{"op": "no_tools"}]
+    tools = out.get("tools", (out.get("config") or {}).get("tools"))
+    assert tools == req.get("tools", (req.get("config") or {}).get("tools"))

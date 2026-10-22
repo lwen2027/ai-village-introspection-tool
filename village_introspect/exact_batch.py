@@ -43,7 +43,7 @@ from . import exact_lib as ex
 from .config import STATE_DIR
 from .probe_jobs import _append_line
 
-SENDABLE = {"anthropic", "openai", "chat", "moonshot"}
+SENDABLE = {"anthropic", "openai", "chat", "moonshot", "gemini"}
 RETRY_DELAYS = (5, 15, 45, 120)  # seconds before each retry of a rate-limited or failed request
 SAMPLE_WORKERS = 5  # samples of one point and question sent at once
 OPENROUTER_API = "https://openrouter.ai/api/v1"
@@ -325,7 +325,9 @@ def _retryable(e: Exception) -> bool:
     status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
     if status in (408, 409, 429, 500, 502, 503, 504, 529):
         return True
-    return type(e).__name__ in ("APIConnectionError", "APITimeoutError", "RemoteProtocolError", "ReadTimeout")
+    return type(e).__name__ in (
+        "APIConnectionError", "APITimeoutError", "RemoteProtocolError", "ReadTimeout", "ConnectError", "ConnectTimeout",
+    )
 
 
 def _fatal(e: Exception) -> bool:
