@@ -30,6 +30,8 @@ import datetime
 import hashlib
 import json
 import os
+import re
+import shlex
 import sys
 import threading
 import time
@@ -129,9 +131,59 @@ def question_op(text: str, call: dict, deliver: str, sender: Optional[str], ment
     if deliver == "append":
         return {"op": "append_user", "text": text}
     if not sender:
-        raise ValueError("delivering a question as user_talk needs a sender name")
+        raise ValueError(f"delivering a question as {deliver} needs a sender name")
     body = f"@{call['agent']} {text}" if mention and call.get("agent") else text
-    return {"op": "user_talk", "text": body, "sender": sender, "at": ex.feed_time(call["created_at"])}
+    actor = "agent" if deliver == "agent_talk" else "human"
+    return {"op": "user_talk", "text": body, "sender": sender, "at": ex.feed_time(call["created_at"]), "actor": actor}
+
+
+# --------------------------------------------------------------------------------------------------
+# continuing past an agent's own pre-send check (Claude Sonnet 4.6's memory rule L1)
+# --------------------------------------------------------------------------------------------------
+PRE_SEND_SCRIPT = "pre_send_chat.sh"
+PRE_SEND_MARK = "=== PRE-SEND CHAT CHECK ==="
+
+
+def pre_send_template(conn, agent_id: str, before: str) -> Optional[str]:
+    """The latest real output of the agent's pre-send check logged before a call (as the harness wrote
+    it, escaped inside 'Output: "..."'), from the check onwards; None if it never ran in the 2 days before."""
+    rows = conn.execute(
+        "select input from llm_calls where agent_id = %s and created_at between %s::timestamp - interval '2 days' and %s "
+        "and position(%s in input::text) > 0 order by created_at desc limit 1",
+        (agent_id, before, before, PRE_SEND_MARK),
+    ).fetchall()
+    for (inp,) in rows:
+        for m in reversed(inp.get("messages") or []):
+            for b in m.get("content") if isinstance(m.get("content"), list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    c = b.get("content")
+                    t = c if isinstance(c, str) else "".join(x.get("text", "") for x in c or [] if isinstance(x, dict))
+                    if PRE_SEND_MARK in t:
+                        return t[t.index(PRE_SEND_MARK) :]
+    return None
+
+
+def pre_send_call(actions: list) -> Optional[str]:
+    """The bash command, if the response's only action is running the pre-send check."""
+    if len(actions) == 1 and actions[0].get("tool") == "bash":
+        cmd = (actions[0].get("args") or {}).get("command") or ""
+        if PRE_SEND_SCRIPT in cmd:
+            return cmd
+    return None
+
+
+def pre_send_output(template: str, command: str) -> str:
+    """The check's output for this command: the real logged output with its Topic/Recipient line set to
+    the arguments the agent passed now."""
+    line = next(l for l in command.splitlines() if PRE_SEND_SCRIPT in l)
+    try:
+        args = shlex.split(line.split(PRE_SEND_SCRIPT, 1)[1])
+    except ValueError:
+        args = []
+    esc = lambda v: v.replace("\\", "\\\\").replace('"', '\\"')
+    topic, recipient = (args + ["", ""])[:2]
+    body = re.sub(r"Topic: .*? \| Recipient: [^\\]*", lambda _: f"Topic: {esc(topic)} | Recipient: {esc(recipient)}", template, count=1)
+    return 'Output: "' + body if not body.startswith("Output:") else body
 
 
 def plan(
@@ -144,6 +196,7 @@ def plan(
     deliver: str = "user_talk",
     sender: Optional[str] = None,
     mention: bool = True,
+    continue_pre_send: bool = False,
 ) -> list:
     """One entry per (point, question variant): {key, agent, point, question_id, question, edits,
     prepared?, estimate?, skip?}. `variants` is [(question id, text or None for a plain replay)]; `edits`
@@ -155,6 +208,9 @@ def plan(
             err = None
         except Exception as e:  # noqa: BLE001 - reported in the plan, the rest still runs
             call, err = None, f"could not load: {type(e).__name__}: {str(e)[:200]}"
+        template = None
+        if continue_pre_send and call and ex.provider_of(call["request"]) == "anthropic":
+            template = pre_send_template(conn, call["agent_id"], call["created_at"])
         for qid, text in variants:
             item = {"key": point_key(agent, p), "agent": agent, "point": p, "question_id": qid, "question": text}
             items.append(item)
@@ -167,6 +223,8 @@ def plan(
                 item["skip"] = str(e)
                 continue
             item["edits"] = ops
+            if template:
+                item["pre_send_template"] = template
             try:
                 pp = ex.prepare(call, ops, conn=conn)
             except Exception as e:  # noqa: BLE001
@@ -226,6 +284,33 @@ def done_samples(path: Path) -> set:
     return done
 
 
+def is_answered(rec: dict) -> bool:
+    """Whether a sample answered: text output, or a chat message with content (an action alone, such as a
+    pause, is not an answer)."""
+    if rec.get("error"):
+        return False
+    if (rec.get("text") or "").strip():
+        return True
+    for c in rec.get("tool_calls") or []:
+        if c.get("tool") == "send_message_to_chat" and str((c.get("args") or {}).get("message") or "").strip():
+            return True
+    return False
+
+
+def answered_counts(path: Path) -> dict:
+    """{(point key, question id): answered samples} already in an output file."""
+    counts = collections.Counter()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if is_answered(r):
+                counts[(r["key"], r["question_id"])] += 1
+    return counts
+
+
 def _retryable(e: Exception) -> bool:
     msg = str(e).lower()
     if "insufficient_quota" in msg or "credit" in msg and "402" in msg:
@@ -260,11 +345,43 @@ class Run:
             _append_line(self.out_path, rec)
 
 
-def run_point(run: Run, it: dict, meta: dict, n: int, done: set, keep_raw: bool, log) -> list:
+def _send_retrying(run: "Run", pp: dict) -> dict:
+    """One sample, retried on rate limits and server errors; a failure comes back as {"error": ...}."""
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            return ex.send(pp)
+        except Exception as e:  # noqa: BLE001 - retried, or recorded with the sample
+            if _fatal(e):
+                run.stop = f"{type(e).__name__}: {str(e)[:200]}"
+            if attempt < len(RETRY_DELAYS) and _retryable(e) and not run.stop:
+                time.sleep(RETRY_DELAYS[attempt])
+                continue
+            return {"error": f"{type(e).__name__}: {str(e)[:500]}"}
+    return {"error": "no attempt made"}
+
+
+def run_point(
+    run: Run,
+    it: dict,
+    meta: dict,
+    n: int,
+    done: set,
+    keep_raw: bool,
+    log,
+    min_answers: Optional[int] = None,
+    max_attempts: Optional[int] = None,
+    answered_before: int = 0,
+) -> list:
+    """n samples; or, with min_answers, samples until that many answered (is_answered) or max_attempts
+    (default 2 x min_answers) samples have been drawn, counting what an earlier run already wrote."""
     pp, p = it["prepared"], it["point"]
     meta = {**meta, **{k: it[k] for k in ("question_id", "question", "edits") if k in it}}
     recs = []
-    for i in range(n):
+    answered = answered_before
+    limit = (max_attempts or 2 * min_answers) if min_answers else n
+    for i in range(limit):
+        if min_answers and answered >= min_answers:
+            break
         if (it["key"], meta["question_id"], i) in done:
             continue
         if run.stop:
@@ -286,18 +403,26 @@ def run_point(run: Run, it: dict, meta: dict, n: int, done: set, keep_raw: bool,
             "sha256_sent": pp["sha256_sent"],
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         }
-        for attempt in range(len(RETRY_DELAYS) + 1):
+        s = _send_retrying(run, pp)
+        first_usd = None
+        cmd = pre_send_call(s.get("actions", [])) if it.get("pre_send_template") and "error" not in s else None
+        if cmd:  # the agent ran its own pre-send check: give it the check's output and take its next turn
+            output = pre_send_output(it["pre_send_template"], cmd)
+            first_usd = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
+            rec["turn1"] = {
+                "text": s.get("text"),
+                "thinking": s.get("thinking"),
+                "tool_calls": s.get("actions", []),
+                "usage": s.get("usage"),
+                "usd": first_usd,
+            }
+            rec["continued"] = {"after": PRE_SEND_SCRIPT, "tool_output": output}
             try:
-                s = ex.send(pp)
-                break
-            except Exception as e:  # noqa: BLE001 - retried, or recorded with the sample
-                if _fatal(e):
-                    run.stop = f"{type(e).__name__}: {str(e)[:200]}"
-                if attempt < len(RETRY_DELAYS) and _retryable(e) and not run.stop:
-                    time.sleep(RETRY_DELAYS[attempt])
-                    continue
-                s = {"error": f"{type(e).__name__}: {str(e)[:500]}"}
-                break
+                req2 = ex.continue_after_tool(pp["request"], s["raw"], output)
+            except (KeyError, ValueError) as e:
+                s = {"error": f"could not continue: {e}"}
+            else:
+                s = _send_retrying(run, {**pp, "request": req2})
         raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
         if raw.get("provider"):  # OpenRouter: the upstream provider that actually served the sample
             rec["served_by"] = raw["provider"]
@@ -309,24 +434,46 @@ def run_point(run: Run, it: dict, meta: dict, n: int, done: set, keep_raw: bool,
         rec["tool_calls"] = s.get("actions", [])  # with their arguments: a chat message's text lives here
         rec["actions"] = [ex.action_label(a) for a in s.get("actions", [])]
         rec["usd"] = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
+        if first_usd is not None:
+            rec["usd"] = (rec["usd"] or 0.0) + first_usd
+        rec["answered"] = is_answered(rec)
+        answered += rec["answered"]
         run.charge(rec["usd"])
         run.write(rec)
         recs.append(rec)
-        what = rec.get("error") or (", ".join(rec["actions"]) or "(text only)")
+        what = rec.get("error") or (", ".join(rec["actions"]) or "(text only)") + ("" if rec["answered"] else " · NO ANSWER")
         cost = f"${rec['usd']:.3f}" if rec["usd"] is not None else "$?"
         log(f"{it['agent'][:20]:20} {meta['question_id'][:10]:10} #{i + 1}  {what[:80]}  {cost} · total ${run.spent:.2f}")
     return recs
 
 
-def execute(items: list, meta: dict, n: int, out_path: Path, budget: float, workers: int, keep_raw: bool, log=print):
-    """Send the plan's samples. Returns (records written this run, Run)."""
+def execute(
+    items: list,
+    meta: dict,
+    n: int,
+    out_path: Path,
+    budget: float,
+    workers: int,
+    keep_raw: bool,
+    log=print,
+    min_answers: Optional[int] = None,
+    max_attempts: Optional[int] = None,
+):
+    """Send the plan's samples (see run_point for min_answers). Returns (records written this run, Run)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = done_samples(out_path)
+    before = answered_counts(out_path) if min_answers else {}
     run = Run(out_path, budget)
     todo = [it for it in items if "skip" not in it]
     recs = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futs = [pool.submit(run_point, run, it, meta, n, done, keep_raw, log) for it in todo]
+        futs = [
+            pool.submit(
+                run_point, run, it, meta, n, done, keep_raw, log, min_answers, max_attempts,
+                before.get((it["key"], it.get("question_id")), 0),
+            )
+            for it in todo
+        ]
         for f in concurrent.futures.as_completed(futs):
             recs.extend(f.result())
     return recs, run
@@ -347,6 +494,7 @@ def summarize(path: Path, batch: Optional[str] = None, out=None) -> None:
     total = 0.0
     for rs in by_key.values():
         ok = [r for r in rs if not r.get("error")]
+        unanswered = sum(1 for r in ok if not is_answered(r))
         total += sum(r.get("usd") or 0 for r in rs)
         tally = collections.Counter(", ".join(r["actions"]) or "(text only)" for r in ok)
         errs = len(rs) - len(ok)
@@ -354,7 +502,8 @@ def summarize(path: Path, batch: Optional[str] = None, out=None) -> None:
         print(
             f"{r0['agent'][:20]:20} {r0['rule'][:14]:14} {r0['question_id'][:10]:10} logged {str(r0.get('logged_action'))[:22]:22} → "
             + ("; ".join(f"{k} ×{v}" for k, v in tally.most_common()) or "-")
-            + (f"  ({errs} errors)" if errs else ""),
+            + (f"  ({errs} errors)" if errs else "")
+            + (f"  ({unanswered} without an answer)" if unanswered else ""),
             file=out,
         )
     print(f"\n{len(by_key)} point × question runs · ${total:.2f} spent in total", file=out)

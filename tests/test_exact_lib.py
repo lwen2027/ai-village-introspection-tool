@@ -347,3 +347,32 @@ def test_new_feed_copies_a_later_harness_clock_line_with_the_questions_time():
     t = out["messages"][-1]["content"][0]["text"]
     assert log[0]["delivered"] == "new_feed"
     assert t.endswith("]\n\n" + ex.FEED_REMINDER + "\n\nThe current time is Wednesday, August 5, 2026, 10:03 AM PT.")
+
+
+def test_agent_talk_is_an_agent_event_in_the_feed():
+    req = {"model": "deepseek/deepseek-v3.2", "messages": [{"role": "user", "content": [{"type": "text", "text": EVENT_FEED}]}]}
+    out, _ = ex.apply_edits(req, [{"op": "user_talk", "text": "@B Q?", "sender": "DeepSeek-V3.2", "at": "t", "actor": "agent"}])
+    t = out["messages"][-1]["content"][0]["text"]
+    assert '"actionType": "AGENT_TALK",\n    "agentName": "DeepSeek-V3.2",\n    "content": "@B Q?"' in t and "userName" not in t
+
+
+def test_continue_after_tool_lays_out_the_next_turn_like_the_harness():
+    req = anthropic_req()
+    resp = {
+        "content": [
+            {"type": "thinking", "thinking": "check first", "signature": "sig", "extra": 1},
+            {"type": "text", "text": "Let me check.", "citations": None},
+            {"type": "tool_use", "id": "tu1", "name": "bash", "input": {"command": "x"}, "caller": None},
+        ]
+    }
+    out = ex.continue_after_tool(req, resp, 'Output: "ok"\n')
+    a, r, f = out["messages"][-3:]
+    assert a == {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "check first", "signature": "sig"},
+        {"type": "text", "text": "Let me check."},
+        {"type": "tool_use", "id": "tu1", "name": "bash", "input": {"command": "x"}},
+    ]}
+    assert r["content"] == [{"type": "tool_result", "tool_use_id": "tu1", "content": [{"type": "text", "text": 'Output: "ok"\n'}]}]
+    assert f["content"] == [{"type": "text", "text": ex.FEED_EMPTY}] and len(out["messages"]) == len(req["messages"]) + 3
+    with pytest.raises(ValueError):
+        ex.continue_after_tool(req, {"content": [{"type": "text", "text": "hi"}]}, "x")

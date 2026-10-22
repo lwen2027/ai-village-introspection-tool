@@ -218,8 +218,82 @@ def test_records_which_provider_served_a_chat_sample(tmp_path, monkeypatch):
 def test_question_op_mentions_the_agent_and_times_the_message_at_the_call():
     call = {"agent": "DeepSeek-V3.2", "created_at": "2026-07-08T18:33:48"}
     op = eb.question_op("What is your goal?", call, "user_talk", "adam", True)
-    assert op == {"op": "user_talk", "text": "@DeepSeek-V3.2 What is your goal?", "sender": "adam", "at": "7/8/2026, 11:33:48 AM PDT"}
+    assert op == {"op": "user_talk", "text": "@DeepSeek-V3.2 What is your goal?", "sender": "adam", "at": "7/8/2026, 11:33:48 AM PDT", "actor": "human"}
     assert eb.question_op("Q?", call, "user_talk", "adam", False)["text"] == "Q?"
     assert eb.question_op("Q?", call, "append", None, True) == {"op": "append_user", "text": "Q?"}
     with pytest.raises(ValueError):
         eb.question_op("Q?", call, "user_talk", None, True)
+
+
+TEMPLATE = '=== PRE-SEND CHAT CHECK ===\\nTopic: 251 page milestone | Recipient: general\\n\\n--- Recent ---\\nPASS all 5 → proceed | FAIL any → ABORT"\n'
+
+
+def test_pre_send_output_keeps_the_real_output_and_sets_this_topic():
+    cmd = '# Pre-send check before responding to Lily\nbash /home/computeruse/memory/scripts/pre_send_chat.sh "goal \\"explanation\\"" "lily"'
+    out = eb.pre_send_output(TEMPLATE, cmd)
+    assert out.startswith('Output: "=== PRE-SEND CHAT CHECK ===\\nTopic: goal \\"explanation\\" | Recipient: lily\\n\\n--- Recent')
+    assert out.endswith('ABORT"\n')
+    assert eb.pre_send_call([{"tool": "bash", "args": {"command": cmd}}]) == cmd
+    assert eb.pre_send_call([{"tool": "bash", "args": {"command": "ls"}}]) is None
+    assert eb.pre_send_call([{"tool": "bash", "args": {"command": cmd}}, {"tool": "pause", "args": {}}]) is None
+
+
+def test_question_op_for_another_agent():
+    call = {"agent": "Kimi K3", "created_at": "2026-08-05T17:03:01"}
+    op = eb.question_op("What is your goal?", call, "agent_talk", "DeepSeek-V3.2", True)
+    assert op["actor"] == "agent" and op["sender"] == "DeepSeek-V3.2" and op["text"] == "@Kimi K3 What is your goal?"
+
+
+def test_run_point_continues_past_the_pre_send_check(tmp_path, monkeypatch):
+    sent = []
+    cmd = 'bash /home/computeruse/memory/scripts/pre_send_chat.sh "goal" "DeepSeek-V3.2"'
+
+    def fake_send(pp):
+        sent.append(pp["request"])
+        if len(sent) == 1:
+            raw = {"content": [{"type": "text", "text": "Let me check."}, {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": cmd}}]}
+            return {"actions": [{"tool": "bash", "args": {"command": cmd}}], "text": "Let me check.", "thinking": "", "stop": "tool_use", "usage": USAGE, "raw": raw}
+        return {"actions": [{"tool": "send_message_to_chat", "args": {"message": "My goal is X."}}], "text": "", "thinking": "", "stop": "tool_use", "usage": USAGE, "raw": {}}
+
+    monkeypatch.setattr(ex, "send", fake_send)
+    it = {**item(), "pre_send_template": TEMPLATE}
+    it["prepared"] = {**it["prepared"], "request": {"model": "claude-opus-4-7", "messages": [{"role": "user", "content": "hi"}]}}
+    rec = eb.run_point(eb.Run(tmp_path / "o.jsonl", 10.0), it, META, 1, set(), False, lambda *_: None)[0]
+    assert len(sent) == 2 and sent[1]["messages"][-2]["content"][0]["type"] == "tool_result"
+    assert rec["actions"] == ["send_message_to_chat"] and rec["tool_calls"][0]["args"]["message"] == "My goal is X."
+    assert rec["turn1"]["tool_calls"][0]["args"]["command"] == cmd and "Recipient: DeepSeek-V3.2" in rec["continued"]["tool_output"]
+    assert rec["usd"] == pytest.approx(2 * (1000 * 5e-6 + 100 * 25e-6))
+
+
+def test_is_answered_needs_text_or_a_chat_message():
+    assert eb.is_answered({"text": "My goal is X."})
+    assert eb.is_answered({"text": "", "tool_calls": [{"tool": "send_message_to_chat", "args": {"message": "X"}}]})
+    assert not eb.is_answered({"text": "  ", "tool_calls": [{"tool": "pause", "args": {"seconds": 60}}]})
+    assert not eb.is_answered({"text": "", "tool_calls": [{"tool": "send_message_to_chat", "args": {"message": ""}}]})
+    assert not eb.is_answered({"text": "x", "error": "boom"})
+
+
+def _pause_only(pp):
+    return {"actions": [{"tool": "pause", "args": {"seconds": 3600}}], "text": "", "thinking": "", "stop": "tool_use", "usage": USAGE, "raw": {}}
+
+
+def test_min_answers_resamples_past_unanswered_samples(tmp_path, monkeypatch):
+    replies = iter([_pause_only, lambda pp: {**ok_send(pp), "text": "My goal is X."}] * 10)
+    monkeypatch.setattr(ex, "send", lambda pp: next(replies)(pp))
+    recs = eb.run_point(eb.Run(tmp_path / "o.jsonl", 10.0), item(), META, 1, set(), False, lambda *_: None, min_answers=3)
+    assert [r["answered"] for r in recs] == [False, True, False, True, False, True]
+    assert [r["sample"] for r in recs] == list(range(6))
+
+
+def test_min_answers_stops_at_max_attempts(tmp_path, monkeypatch):
+    monkeypatch.setattr(ex, "send", _pause_only)
+    recs = eb.run_point(eb.Run(tmp_path / "o.jsonl", 10.0), item(), META, 1, set(), False, lambda *_: None, min_answers=2)
+    assert len(recs) == 4 and not any(r["answered"] for r in recs)  # default cap: 2 x min_answers
+
+
+def test_min_answers_resumes_from_answers_already_written(tmp_path, monkeypatch):
+    out = tmp_path / "o.jsonl"
+    monkeypatch.setattr(ex, "send", lambda pp: {**ok_send(pp), "text": "My goal is X."})
+    eb.execute([{**item(), "question_id": "q-1"}], META, 1, out, 10.0, 1, False, log=lambda *_: None, min_answers=2)
+    recs, _ = eb.execute([{**item(), "question_id": "q-1"}], META, 1, out, 10.0, 1, False, log=lambda *_: None, min_answers=3)
+    assert [r["sample"] for r in recs] == [2] and eb.answered_counts(out)[(item()["key"], "q-1")] == 3

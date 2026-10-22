@@ -235,11 +235,15 @@ def _feed_suffix(msgs: list, at: str) -> str:
     return "\n\n" + FEED_REMINDER
 
 
-def add_user_talk(req: dict, provider: str, text: str, sender: str, at: str) -> str:
-    """Deliver `text` the way a human's chat message reaches the agent: a USER_TALK event in the feed of
-    the turn being replayed. Returns how: 'appended' (to the feed's events), 'filled' (an empty feed), or
-    'new_feed' (the request had no feed after the agent's last output, so one is added)."""
-    event = {"actionType": "USER_TALK", "userName": sender, "content": text, "createdAt": at}
+def add_user_talk(req: dict, provider: str, text: str, sender: str, at: str, actor: str = "human") -> str:
+    """Deliver `text` the way a chat message reaches the agent: a USER_TALK event from a human (or, with
+    actor='agent', an AGENT_TALK event from another village agent) in the feed of the turn being
+    replayed. Returns how: 'appended' (to the feed's events), 'filled' (an empty feed), or 'new_feed' (the
+    request had no feed after the agent's last output, so one is added)."""
+    if actor == "agent":
+        event = {"actionType": "AGENT_TALK", "agentName": sender, "content": text, "createdAt": at}
+    else:
+        event = {"actionType": "USER_TALK", "userName": sender, "content": text, "createdAt": at}
     msgs = req["messages"] if provider in ("anthropic", "chat") else req["input"] if provider == "openai" else None
     if msgs is None:
         raise ValueError(f"user_talk is not supported for {provider} requests")
@@ -264,6 +268,31 @@ def add_user_talk(req: dict, provider: str, text: str, sender: str, at: str) -> 
     return "new_feed"
 
 
+_BLOCK_KEYS = {
+    "thinking": ("type", "thinking", "signature"),
+    "redacted_thinking": ("type", "data"),
+    "text": ("type", "text"),
+    "tool_use": ("type", "id", "name", "input"),
+}
+
+
+def continue_after_tool(req: dict, response: dict, tool_output: str, feed: str = FEED_EMPTY) -> dict:
+    """An Anthropic request one turn on: the model's response (thinking with its signature, text, tool
+    call) as the assistant turn, the tool call's result as the harness writes it (a text block
+    'Output: "..."'), then the next feed, which is how the village harness lays out every turn."""
+    blocks = [{k: b[k] for k in _BLOCK_KEYS[b["type"]] if k in b} for b in response["content"] if b.get("type") in _BLOCK_KEYS]
+    uses = [b for b in blocks if b["type"] == "tool_use"]
+    if len(uses) != 1:
+        raise ValueError(f"expected one tool call to continue after, got {len(uses)}")
+    out = copy.deepcopy(req)
+    out["messages"] += [
+        {"role": "assistant", "content": blocks},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": [{"type": "text", "text": tool_output}]}]},
+        {"role": "user", "content": [{"type": "text", "text": feed}]},
+    ]
+    return out
+
+
 def apply_edits(req: dict, edits: list) -> tuple:
     """(modified copy, log). Ops:
     {"op": "delete_section", "heading": str}      remove a section of the internal memory
@@ -273,9 +302,9 @@ def apply_edits(req: dict, edits: list) -> tuple:
     {"op": "add_tool", "tool": {name, description, parameters}, "doc": str?}
                                                   offer a new tool (and list it in the <tools> section)
     {"op": "append_user", "text": str}            add a user message at the end (an interview question)
-    {"op": "user_talk", "text": str, "sender": str, "at": str}
-                                                  deliver a question as a human's chat message: a USER_TALK
-                                                  event in the replayed turn's feed (see add_user_talk)
+    {"op": "user_talk", "text": str, "sender": str, "at": str, "actor": "human" | "agent"}
+                                                  deliver a question as a chat message from a human (USER_TALK)
+                                                  or another agent (AGENT_TALK) in the replayed turn's feed
     {"op": "drop_thinking"}                       drop earlier Anthropic thinking blocks (needed when an
                                                   edit would invalidate them on models that check)"""
     out = copy.deepcopy(req)
@@ -326,7 +355,7 @@ def apply_edits(req: dict, edits: list) -> tuple:
             _append_user(out, provider, e["text"])
             log.append(e)
         elif op == "user_talk":
-            how = add_user_talk(out, provider, e["text"], e["sender"], e["at"])
+            how = add_user_talk(out, provider, e["text"], e["sender"], e["at"], e.get("actor", "human"))
             log.append({**e, "delivered": how})
         elif op == "drop_thinking":
             n = 0

@@ -162,6 +162,9 @@ def _cmd_replay(args) -> None:
 def _cmd_batch(args) -> None:
     from . import exact_batch as eb
 
+    if args.min_answers:
+        args.n = args.min_answers  # the plan prices the answers needed; unanswered extra samples cost more
+
     with open(args.points, encoding="utf-8") as f:
         data = json.load(f)
     rules = set(args.rules.split(",")) if args.rules else None
@@ -171,6 +174,11 @@ def _cmd_batch(args) -> None:
         raise SystemExit("pass --question or --questions, not both")
     if args.questions:
         variants = eb.load_variants(args.questions)
+        if args.only:
+            prefixes = tuple(args.only.split(","))
+            variants = [v for v in variants if v[0].startswith(prefixes)]
+            if not variants:
+                raise SystemExit(f"--only {args.only!r} matches no question id in {args.questions}")
         name = args.name or Path(args.questions).stem
     else:
         variants = [(eb.question_id(args.question, args.question_id), args.question)]
@@ -186,7 +194,16 @@ def _cmd_batch(args) -> None:
     )
     with ex._connect() as conn:
         items = eb.plan(
-            conn, points, variants, args.n, args.assume_output, edits, args.deliver, args.sender, not args.no_mention
+            conn,
+            points,
+            variants,
+            args.n,
+            args.assume_output,
+            edits,
+            args.deliver,
+            args.sender,
+            not args.no_mention,
+            args.continue_pre_send,
         )
     if args.providers:
         keep = set(args.providers.split(","))
@@ -198,8 +215,24 @@ def _cmd_batch(args) -> None:
         return
     if planned > args.budget_usd and not args.force:
         raise SystemExit(f"not sent: planned ${planned:.2f} is over --budget-usd {args.budget_usd:.2f}")
-    meta = {"batch": name, "points_file": str(args.points), "deliver": args.deliver, "sender": args.sender}
-    _, run = eb.execute(items, meta, args.n, out_path, args.budget_usd, args.workers, args.keep_raw)
+    meta = {
+        "batch": name,
+        "points_file": str(args.points),
+        "deliver": args.deliver,
+        "sender": args.sender,
+        "continue_pre_send": args.continue_pre_send,
+    }
+    _, run = eb.execute(
+        items,
+        meta,
+        args.n,
+        out_path,
+        args.budget_usd,
+        args.workers,
+        args.keep_raw,
+        min_answers=args.min_answers,
+        max_attempts=args.max_attempts,
+    )
     if run.stop:
         print(f"stopped early: {run.stop}", file=sys.stderr)
     print(f"spent ${run.spent:.2f} this run\n")
@@ -238,15 +271,30 @@ def main(argv=None) -> None:
     b.add_argument("--question-id", help="label for the question (default: a hash of its text, or 'replay')")
     b.add_argument("--questions", help="JSON file of question variants, each asked at every point (see exact_batch)")
     b.add_argument("--name", help="batch name (default: the variants file's name, or the question id)")
+    b.add_argument("--only", help="comma-separated question-id prefixes to ask from --questions, e.g. belief-")
     b.add_argument(
         "--deliver",
-        choices=["user_talk", "append"],
+        choices=["user_talk", "agent_talk", "append"],
         default="user_talk",
-        help="user_talk (default): as a human's chat message in the turn's event feed; append: a bare user message",
+        help="user_talk (default): a human's chat message in the turn's event feed; agent_talk: another agent's "
+        "chat message there; append: a bare user message",
     )
-    b.add_argument("--sender", help="the human's chat name for --deliver user_talk")
+    b.add_argument("--sender", help="the human's or agent's chat name for --deliver user_talk / agent_talk")
+    b.add_argument(
+        "--continue-pre-send",
+        action="store_true",
+        help="when a Claude agent's only action is its own pre_send_chat.sh check, give it the check's real "
+        "logged output and record its next turn",
+    )
     b.add_argument("--no-mention", action="store_true", help="don't @-address the question to the agent")
     b.add_argument("-n", type=int, default=1, help="samples per point (default 1)")
+    b.add_argument(
+        "--min-answers",
+        type=int,
+        help="sample until this many answered (text or a chat message) per point and question, instead of -n; "
+        "unanswered samples are kept as data",
+    )
+    b.add_argument("--max-attempts", type=int, help="with --min-answers: stop after this many samples (default 2x)")
     b.add_argument("--budget-usd", type=float, default=5.0, help="refuse a larger plan, stop at this spend (default 5)")
     b.add_argument("--assume-output", type=int, default=1500, help="output tokens assumed where none were logged")
     b.add_argument("--workers", type=int, default=4, help="points sent in parallel (default 4)")
