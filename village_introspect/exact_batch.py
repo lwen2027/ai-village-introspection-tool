@@ -284,17 +284,23 @@ def done_samples(path: Path) -> set:
     return done
 
 
+PRE_SEND_SCRIPT = "pre_send_chat.sh"
+LEAD_IN_CHARS = 200  # text shorter than this before a pre-send check is a lead-in ("Let me run my check…")
+
+
 def is_answered(rec: dict) -> bool:
     """Whether a sample answered: text output, or a chat message with content (an action alone, such as a
-    pause, is not an answer)."""
+    pause, is not an answer). A short lead-in followed by the pre-send chat check is not an answer either."""
     if rec.get("error"):
         return False
-    if (rec.get("text") or "").strip():
-        return True
-    for c in rec.get("tool_calls") or []:
+    calls = rec.get("tool_calls") or []
+    for c in calls:
         if c.get("tool") == "send_message_to_chat" and str((c.get("args") or {}).get("message") or "").strip():
             return True
-    return False
+    text = (rec.get("text") or "").strip()
+    if any(PRE_SEND_SCRIPT in json.dumps(c.get("args") or {}) for c in calls):
+        return len(text) >= LEAD_IN_CHARS
+    return bool(text)
 
 
 def answered_counts(path: Path) -> dict:

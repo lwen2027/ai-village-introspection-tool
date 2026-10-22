@@ -273,6 +273,13 @@ def test_is_answered_needs_text_or_a_chat_message():
     assert not eb.is_answered({"text": "x", "error": "boom"})
 
 
+def test_is_answered_rejects_a_lead_in_before_the_pre_send_check():
+    check = {"tool": "bash", "args": {"command": "bash /home/computeruse/memory/scripts/pre_send_chat.sh \"goal\" \"human\""}}
+    assert not eb.is_answered({"text": "Let me run my pre-send check before responding.", "tool_calls": [check]})
+    assert eb.is_answered({"text": "My goal is X. " * 20, "tool_calls": [check]})
+    assert eb.is_answered({"text": "Short.", "tool_calls": [{"tool": "bash", "args": {"command": "ls"}}]})
+
+
 def _pause_only(pp):
     return {"actions": [{"tool": "pause", "args": {"seconds": 3600}}], "text": "", "thinking": "", "stop": "tool_use", "usage": USAGE, "raw": {}}
 
