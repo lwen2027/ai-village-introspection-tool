@@ -125,6 +125,30 @@ def test_quota_error_stops_the_run_without_retrying(tmp_path, monkeypatch):
     assert len(attempts) == 1 and len(recs) == 1 and "insufficient_quota" in recs[0]["error"] and run.stop
 
 
+def test_run_point_sends_a_probe_then_the_rest_in_parallel(tmp_path, monkeypatch):
+    import threading
+
+    together = threading.Barrier(4, timeout=5)  # samples 2-5 must be in flight at the same time
+    calls = []
+
+    def send(pp):
+        calls.append(1)
+        if len(calls) > 1:
+            together.wait()
+        return ok_send(pp)
+
+    monkeypatch.setattr(ex, "send", send)
+    recs = eb.run_point(eb.Run(tmp_path / "o.jsonl", 10.0), item(), META, 5, set(), False, lambda *_: None)
+    assert [r["sample"] for r in recs] == [0, 1, 2, 3, 4] and len(calls) == 5
+
+
+def test_min_answers_sends_only_the_missing_answers(tmp_path, monkeypatch):
+    monkeypatch.setattr(ex, "send", lambda pp: {**ok_send(pp), "text": "My goal is X."})
+    recs = eb.run_point(eb.Run(tmp_path / "o.jsonl", 10.0), item(), META, 1, set(), False, lambda *_: None,
+                        min_answers=5, answered_before=2)
+    assert len(recs) == 3
+
+
 def test_budget_stops_further_samples(tmp_path, monkeypatch):
     monkeypatch.setattr(ex, "send", ok_send)
     run = eb.Run(tmp_path / "o.jsonl", budget=0.01)  # each sample costs $0.0075

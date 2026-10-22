@@ -28,6 +28,7 @@ import collections
 import concurrent.futures
 import datetime
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -44,6 +45,7 @@ from .probe_jobs import _append_line
 
 SENDABLE = {"anthropic", "openai", "chat", "moonshot"}
 RETRY_DELAYS = (5, 15, 45, 120)  # seconds before each retry of a rate-limited or failed request
+SAMPLE_WORKERS = 5  # samples of one point and question sent at once
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 
 
@@ -284,7 +286,6 @@ def done_samples(path: Path) -> set:
     return done
 
 
-PRE_SEND_SCRIPT = "pre_send_chat.sh"
 LEAD_IN_CHARS = 200  # text shorter than this before a pre-send check is a lead-in ("Let me run my check…")
 
 
@@ -379,78 +380,94 @@ def run_point(
     answered_before: int = 0,
 ) -> list:
     """n samples; or, with min_answers, samples until that many answered (is_answered) or max_attempts
-    (default 2 x min_answers) samples have been drawn, counting what an earlier run already wrote."""
-    pp, p = it["prepared"], it["point"]
+    (default 2 x min_answers) samples have been drawn, counting what an earlier run already wrote.
+    The first sample goes alone; then rounds go out in parallel, each as many samples as answers are
+    still missing, and no more than the remaining budget covers at the cost per sample seen so far."""
     meta = {**meta, **{k: it[k] for k in ("question_id", "question", "edits") if k in it}}
     recs = []
     answered = answered_before
     limit = (max_attempts or 2 * min_answers) if min_answers else n
-    for i in range(limit):
-        if min_answers and answered >= min_answers:
-            break
-        if (it["key"], meta["question_id"], i) in done:
-            continue
-        if run.stop:
-            break
-        rec = {
-            **meta,
-            "key": it["key"],
-            "agent": it["agent"],
-            "track": p.get("track", 0),
-            "rule": p["rule"],
-            "category": p.get("category"),
-            "episode_id": p.get("episode_id"),
-            "call_id": p["call_id"],
-            "moment_pt": p.get("moment_pt"),
-            "logged_action": p.get("call_action"),
-            "sample": i,
-            "model": pp["model"],
-            "provider": pp["provider"],
-            "sha256_sent": pp["sha256_sent"],
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    todo = (i for i in range(limit) if (it["key"], meta["question_id"], i) not in done)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SAMPLE_WORKERS) as pool:
+        while not run.stop:
+            want = max(0, min_answers - answered) if min_answers else limit
+            costs = [r["usd"] for r in recs if r.get("usd")]
+            if not recs:
+                want = min(want, 1)
+            elif costs:
+                want = min(want, max(1, int((run.budget - run.spent) / (sum(costs) / len(costs)))))
+            wave = list(itertools.islice(todo, want))
+            if not wave:
+                break
+            for rec in pool.map(lambda i: _sample(run, it, meta, i, keep_raw, log), wave):
+                if rec is not None:
+                    recs.append(rec)
+                    answered += rec["answered"]
+    return sorted(recs, key=lambda r: r["sample"])
+
+
+def _sample(run: Run, it: dict, meta: dict, i: int, keep_raw: bool, log) -> Optional[dict]:
+    """Sample i of one point and question: sent, recorded and written; None once the run has stopped."""
+    if run.stop:
+        return None
+    pp, p = it["prepared"], it["point"]
+    rec = {
+        **meta,
+        "key": it["key"],
+        "agent": it["agent"],
+        "track": p.get("track", 0),
+        "rule": p["rule"],
+        "category": p.get("category"),
+        "episode_id": p.get("episode_id"),
+        "call_id": p["call_id"],
+        "moment_pt": p.get("moment_pt"),
+        "logged_action": p.get("call_action"),
+        "sample": i,
+        "model": pp["model"],
+        "provider": pp["provider"],
+        "sha256_sent": pp["sha256_sent"],
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    s = _send_retrying(run, pp)
+    first_usd = None
+    cmd = pre_send_call(s.get("actions", [])) if it.get("pre_send_template") and "error" not in s else None
+    if cmd:  # the agent ran its own pre-send check: give it the check's output and take its next turn
+        output = pre_send_output(it["pre_send_template"], cmd)
+        first_usd = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
+        rec["turn1"] = {
+            "text": s.get("text"),
+            "thinking": s.get("thinking"),
+            "tool_calls": s.get("actions", []),
+            "usage": s.get("usage"),
+            "usd": first_usd,
         }
-        s = _send_retrying(run, pp)
-        first_usd = None
-        cmd = pre_send_call(s.get("actions", [])) if it.get("pre_send_template") and "error" not in s else None
-        if cmd:  # the agent ran its own pre-send check: give it the check's output and take its next turn
-            output = pre_send_output(it["pre_send_template"], cmd)
-            first_usd = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
-            rec["turn1"] = {
-                "text": s.get("text"),
-                "thinking": s.get("thinking"),
-                "tool_calls": s.get("actions", []),
-                "usage": s.get("usage"),
-                "usd": first_usd,
-            }
-            rec["continued"] = {"after": PRE_SEND_SCRIPT, "tool_output": output}
-            try:
-                req2 = ex.continue_after_tool(pp["request"], s["raw"], output)
-            except (KeyError, ValueError) as e:
-                s = {"error": f"could not continue: {e}"}
-            else:
-                s = _send_retrying(run, {**pp, "request": req2})
-        raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
-        if raw.get("provider"):  # OpenRouter: the upstream provider that actually served the sample
-            rec["served_by"] = raw["provider"]
-        if raw.get("model") and raw["model"] != pp["model"]:
-            rec["served_model"] = raw["model"]
-        if not keep_raw:
-            s.pop("raw", None)
-        rec.update(s)
-        rec["tool_calls"] = s.get("actions", [])  # with their arguments: a chat message's text lives here
-        rec["actions"] = [ex.action_label(a) for a in s.get("actions", [])]
-        rec["usd"] = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
-        if first_usd is not None:
-            rec["usd"] = (rec["usd"] or 0.0) + first_usd
-        rec["answered"] = is_answered(rec)
-        answered += rec["answered"]
-        run.charge(rec["usd"])
-        run.write(rec)
-        recs.append(rec)
-        what = rec.get("error") or (", ".join(rec["actions"]) or "(text only)") + ("" if rec["answered"] else " · NO ANSWER")
-        cost = f"${rec['usd']:.3f}" if rec["usd"] is not None else "$?"
-        log(f"{it['agent'][:20]:20} {meta['question_id'][:10]:10} #{i + 1}  {what[:80]}  {cost} · total ${run.spent:.2f}")
-    return recs
+        rec["continued"] = {"after": PRE_SEND_SCRIPT, "tool_output": output}
+        try:
+            req2 = ex.continue_after_tool(pp["request"], s["raw"], output)
+        except (KeyError, ValueError) as e:
+            s = {"error": f"could not continue: {e}"}
+        else:
+            s = _send_retrying(run, {**pp, "request": req2})
+    raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+    if raw.get("provider"):  # OpenRouter: the upstream provider that actually served the sample
+        rec["served_by"] = raw["provider"]
+    if raw.get("model") and raw["model"] != pp["model"]:
+        rec["served_model"] = raw["model"]
+    if not keep_raw:
+        s.pop("raw", None)
+    rec.update(s)
+    rec["tool_calls"] = s.get("actions", [])  # with their arguments: a chat message's text lives here
+    rec["actions"] = [ex.action_label(a) for a in s.get("actions", [])]
+    rec["usd"] = ex.usage_usd(pp["provider"], pp["model"], s.get("usage"))
+    if first_usd is not None:
+        rec["usd"] = (rec["usd"] or 0.0) + first_usd
+    rec["answered"] = is_answered(rec)
+    run.charge(rec["usd"])
+    run.write(rec)
+    what = rec.get("error") or (", ".join(rec["actions"]) or "(text only)") + ("" if rec["answered"] else " · NO ANSWER")
+    cost = f"${rec['usd']:.3f}" if rec["usd"] is not None else "$?"
+    log(f"{it['agent'][:20]:20} {meta['question_id'][:10]:10} #{i + 1}  {what[:80]}  {cost} · total ${run.spent:.2f}")
+    return rec
 
 
 def execute(

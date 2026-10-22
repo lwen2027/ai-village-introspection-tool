@@ -297,7 +297,7 @@ def main(argv=None) -> None:
     b.add_argument("--max-attempts", type=int, help="with --min-answers: stop after this many samples (default 2x)")
     b.add_argument("--budget-usd", type=float, default=5.0, help="refuse a larger plan, stop at this spend (default 5)")
     b.add_argument("--assume-output", type=int, default=1500, help="output tokens assumed where none were logged")
-    b.add_argument("--workers", type=int, default=4, help="points sent in parallel (default 4)")
+    b.add_argument("--workers", type=int, default=12, help="points sent in parallel (default 12)")
     b.add_argument("--out", help="output JSONL (default $VILLAGE_STATE/batches/<batch name>.jsonl); reruns resume")
     b.add_argument("--dry-run", action="store_true", help="plan and price only, no model calls")
     b.add_argument("--keep-raw", action="store_true", help="keep each sample's raw response")
