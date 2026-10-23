@@ -307,6 +307,7 @@ def test_is_answered_rejects_a_lead_in_before_the_pre_send_check():
 def test_is_answered_respects_a_lead_in_review():
     bash = {"tool": "bash", "args": {"command": "echo ok"}}
     assert not eb.is_answered({"text": "Let me test my shell first.", "tool_calls": [bash], "answered_review": "lead_in_only"})
+    assert not eb.is_answered({"text": "Carly replied! " * 30, "answered_review": "ignored_question"})
 
 
 def _pause_only(pp):
