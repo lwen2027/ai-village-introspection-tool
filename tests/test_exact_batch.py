@@ -304,6 +304,11 @@ def test_is_answered_rejects_a_lead_in_before_the_pre_send_check():
     assert eb.is_answered({"text": "Short.", "tool_calls": [{"tool": "bash", "args": {"command": "ls"}}]})
 
 
+def test_is_answered_respects_a_lead_in_review():
+    bash = {"tool": "bash", "args": {"command": "echo ok"}}
+    assert not eb.is_answered({"text": "Let me test my shell first.", "tool_calls": [bash], "answered_review": "lead_in_only"})
+
+
 def _pause_only(pp):
     return {"actions": [{"tool": "pause", "args": {"seconds": 3600}}], "text": "", "thinking": "", "stop": "tool_use", "usage": USAGE, "raw": {}}
 

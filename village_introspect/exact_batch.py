@@ -291,8 +291,9 @@ LEAD_IN_CHARS = 200  # text shorter than this before a pre-send check is a lead-
 
 def is_answered(rec: dict) -> bool:
     """Whether a sample answered: text output, or a chat message with content (an action alone, such as a
-    pause, is not an answer). A short lead-in followed by the pre-send chat check is not an answer either."""
-    if rec.get("error"):
+    pause, is not an answer). A short lead-in followed by the pre-send chat check is not an answer either,
+    nor is a sample a reviewer marked as a lead-in only (answered_review)."""
+    if rec.get("error") or rec.get("answered_review") == "lead_in_only":
         return False
     calls = rec.get("tool_calls") or []
     for c in calls:
